@@ -1,3 +1,6 @@
+(function () {
+'use strict';
+
 const CONFIG = {
   base: 'https://andrew0007-sys.github.io/NovaPost/data',
 
@@ -15,6 +18,21 @@ const CONFIG = {
     'Nova Post address': 'address',
   },
 
+  /**
+   * Hidden twins carrying the human-readable label next to the UUID ref,
+   * so order emails show "№5 — вул. Київська, 253" and not a bare Ref.
+   * Fully owned by this script - do NOT add them in the Designer.
+   *
+   * branch and postomat deliberately share one name: only one of them is
+   * ever enabled, and the delivery type is already in Shipment-type.
+   */
+  mirrors: {
+    area:     'Region-name',
+    city:     'City-name',
+    branch:   'Nova-post-point-name',
+    postomat: 'Nova-post-point-name',
+  },
+
   empty: 'Немає доступних точок',
   failed: 'Не вдалось завантажити список — зв\'яжіться з менеджером',
 };
@@ -22,18 +40,10 @@ const CONFIG = {
 const uk = new Intl.Collator('uk');
 const $ = sel => document.querySelector(sel);
 
-const el = {
-  area: $(CONFIG.area),
-  city: $(CONFIG.city),
-  branch: $(CONFIG.branch),
-  postomat: $(CONFIG.postomat),
-};
+const el = { area: null, city: null, branch: null, postomat: null };
 
 /** Placeholders are already set in Webflow as the first <option> - reuse them. */
 const ph = {};
-for (const [key, node] of Object.entries(el)) {
-  ph[key] = node?.options?.[0]?.text ?? '';
-}
 
 const state = {
   idx: null,
@@ -141,6 +151,41 @@ const pointLabel = p => `№${p[1]} — ${p[2]}`;
 const pointEl = () => (state.type === 'p' ? el.postomat : el.branch);
 const pointPh = () => (state.type === 'p' ? ph.postomat : ph.branch);
 
+/**
+ * Copies the selected option's text into a hidden input so the submission
+ * carries both the ref (for future waybill automation) and a readable label.
+ *
+ * The input exists only while its select is enabled and has a value, so
+ * disabled fields leave nothing behind in the submission. Identity is the
+ * data-np-mirror attribute, not the name - branch and postomat share a name.
+ */
+function mirror(key) {
+  const select = el[key];
+  const name = CONFIG.mirrors[key];
+  const form = select?.closest('form');
+  if (!select || !name || !form) return;
+
+  let input = form.querySelector(`input[data-np-mirror="${key}"]`);
+
+  if (select.disabled || !select.value) {
+    input?.remove();
+    return;
+  }
+
+  if (!input) {
+    input = document.createElement('input');
+    input.type = 'hidden';
+    input.setAttribute('data-np-mirror', key);
+    form.append(input);
+  }
+
+  input.name = name;
+  input.setAttribute('data-name', name);
+  input.value = select.selectedOptions[0]?.text ?? '';
+}
+
+const mirrorAll = () => Object.keys(CONFIG.mirrors).forEach(mirror);
+
 /* ---------- levels ---------- */
 
 async function initAreas() {
@@ -181,6 +226,8 @@ function renderCities() {
   } else {
     state.cityRef = null;
   }
+
+  mirrorAll();
 }
 
 async function onCityChange(cityRef) {
@@ -199,11 +246,13 @@ async function onCityChange(cityRef) {
 
   fill(pointEl(), list.map(p => [p[0], pointLabel(p)]),
        list.length ? pointPh() : CONFIG.empty);
+  mirrorAll();
 }
 
 function clearPoints() {
   fill(el.branch, [], ph.branch);
   fill(el.postomat, [], ph.postomat);
+  mirrorAll();
 }
 
 /* ---------- radio ---------- */
@@ -230,17 +279,54 @@ async function onTypeChange(value) {
 
 /* ---------- start ---------- */
 
-el.area?.addEventListener('change', e => onAreaChange(e.target.value));
-el.city?.addEventListener('change', e => onCityChange(e.target.value));
+function init() {
+  el.area = $(CONFIG.area);
+  el.city = $(CONFIG.city);
+  el.branch = $(CONFIG.branch);
+  el.postomat = $(CONFIG.postomat);
 
-const radios = document.querySelectorAll(`input[name="${CONFIG.radioName}"]`);
-radios.forEach(r => r.addEventListener('change', e => onTypeChange(e.target.value)));
+  for (const [key, node] of Object.entries(el)) {
+    ph[key] = node?.options?.[0]?.text ?? '';
+  }
 
-// One radio is already checked on load - pick up the initial mode from it.
-state.type = CONFIG.modes[[...radios].find(r => r.checked)?.value] ?? null;
+  if (!el.area) {
+    console.warn('[np] region select not found - check the data-np-* attributes');
+    return;
+  }
 
-initAreas().catch(e => {
-  console.error('[np]', e);
-  // A dead select with no explanation on a payment page is the worst outcome.
-  fill(el.area, [], CONFIG.failed);
-});
+  el.area.addEventListener('change', e => onAreaChange(e.target.value));
+  el.city?.addEventListener('change', e => onCityChange(e.target.value));
+
+  // Point selects have no logic of their own - only the mirror.
+  el.branch?.addEventListener('change', () => mirror('branch'));
+  el.postomat?.addEventListener('change', () => mirror('postomat'));
+
+  // The field-visibility script toggles `disabled` on radio change, and we
+  // cannot rely on running after it. Watching the attribute removes the race.
+  const obs = new MutationObserver(mirrorAll);
+  for (const node of Object.values(el)) {
+    if (node) obs.observe(node, { attributes: true, attributeFilter: ['disabled'] });
+  }
+
+  const radios = document.querySelectorAll(`input[name="${CONFIG.radioName}"]`);
+  radios.forEach(r => r.addEventListener('change', e => onTypeChange(e.target.value)));
+
+  // One radio is already checked on load - pick up the initial mode from it.
+  state.type = CONFIG.modes[[...radios].find(r => r.checked)?.value] ?? null;
+
+  initAreas()
+    .then(() => { mirrorAll(); console.log('[np] ready:', state.idx.areas.length, 'areas'); })
+    .catch(e => {
+      console.error('[np]', e);
+      // A dead select with no explanation on a payment page is the worst outcome.
+      fill(el.area, [], CONFIG.failed);
+    });
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', init);
+} else {
+  init();
+}
+
+})();
